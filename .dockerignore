@@ -4,3 +4,6 @@ dist
 .vscode
 *.log
 npm-debug.log*
+.env
+.env.*
+!.env.example

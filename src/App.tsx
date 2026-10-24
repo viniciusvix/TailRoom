@@ -1,16 +1,14 @@
-import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent } from 'react'
 import {
   Activity,
   AlertTriangle,
   Check,
-  ChevronDown,
-  CirclePause,
-  CirclePlay,
   FileUp,
   Filter,
   FolderOpen,
   Globe,
   Info,
+  KeyRound,
   LocateFixed,
   LogOut,
   Mail,
@@ -21,42 +19,100 @@ import {
   Settings2,
   ShieldCheck,
   SlidersHorizontal,
-  SquareTerminal,
   Trash2,
   X,
 } from 'lucide-react'
-import type { Session, User } from '@supabase/supabase-js'
-import { isSupabaseConfigured, supabase } from './lib/supabase'
+import type { AuthError, Session, User } from '@supabase/supabase-js'
+import { isRecoveryRedirect, isSupabaseConfigured, supabase } from './lib/supabase'
+import { defaultSettings, deleteSource, loadSettings, loadSources, saveSettings, saveSource, type Level, type UserSettings } from './lib/userData'
 
-type Level = 'INFO' | 'WARN' | 'ERROR' | 'DEBUG'
 type LogLine = { id: number; timestamp: string; level: Level; message: string }
 type SearchTerm = { id: string; text: string; color: string }
-type HistoryEntry = { id: string; name: string; url?: string; handle?: FileSystemFileHandle }
+// Fonte aberta na sessão: URL remota, arquivo com handle (live tail) ou File comum (drag-and-drop / fallback).
+type OpenSource = { id: string; name: string; url?: string; handle?: FileSystemFileHandle; file?: File }
+// URL salva na conta do usuário (tabela log_sources).
+type SavedUrl = { id?: string; name: string; url: string }
+type AuthMode = 'signin' | 'signup' | 'forgot'
 
 const termColors = ['#f2b56b', '#77d6b1', '#91b6f2', '#e894a8', '#c9a4e8', '#e8d56e']
 
-const seedLines: LogLine[] = [
-  { id: 1, timestamp: '14:32:07.104', level: 'INFO', message: 'Tailroom started · watching workspace logs' },
-  { id: 2, timestamp: '14:32:07.218', level: 'INFO', message: 'Connected to database pool (max=12)' },
-  { id: 3, timestamp: '14:32:08.004', level: 'DEBUG', message: 'GET /api/health 200 18ms' },
-  { id: 4, timestamp: '14:32:09.622', level: 'INFO', message: 'Worker queue ready, waiting for jobs' },
-  { id: 5, timestamp: '14:32:11.015', level: 'WARN', message: 'Retrying request after a 429 response (attempt 2/3)' },
-  { id: 6, timestamp: '14:32:11.836', level: 'DEBUG', message: 'cache:hit key=session:8fa1 ttl=284s' },
-  { id: 7, timestamp: '14:32:12.440', level: 'INFO', message: 'POST /api/events 201 42ms' },
-  { id: 8, timestamp: '14:32:14.091', level: 'ERROR', message: 'Timeout while resolving upstream: payments.internal' },
-  { id: 9, timestamp: '14:32:14.093', level: 'INFO', message: 'Circuit breaker opened for payments.internal' },
-  { id: 10, timestamp: '14:32:15.507', level: 'DEBUG', message: 'healthcheck:redis latency=3ms status=ok' },
-]
-
 const levelClass: Record<Level, string> = { INFO: 'info', WARN: 'warn', ERROR: 'error', DEBUG: 'debug' }
 
-function AuthScreen({ onGoogleSignIn }: { onGoogleSignIn: () => void }) {
-  const [isSigningIn, setIsSigningIn] = useState(false)
+const minPasswordLength = 8
 
-  async function signIn() {
-    setIsSigningIn(true)
+function authErrorMessage(error: AuthError) {
+  switch (error.code) {
+    case 'invalid_credentials': return 'E-mail ou senha incorretos.'
+    case 'email_not_confirmed': return 'Confirme seu e-mail antes de entrar. Verifique sua caixa de entrada.'
+    case 'user_already_exists':
+    case 'email_exists': return 'Já existe uma conta com este e-mail.'
+    case 'weak_password': return `Senha fraca. Use pelo menos ${minPasswordLength} caracteres, misturando letras e números.`
+    case 'same_password': return 'A nova senha precisa ser diferente da atual.'
+    case 'over_email_send_rate_limit':
+    case 'over_request_rate_limit': return 'Muitas tentativas. Aguarde alguns minutos e tente novamente.'
+    case 'signup_disabled': return 'O cadastro de novas contas está desativado.'
+    default: return error.message || 'Não foi possível concluir a operação.'
+  }
+}
+
+function AuthScreen({ onGoogleSignIn }: { onGoogleSignIn: () => void }) {
+  const [mode, setMode] = useState<AuthMode>('signin')
+  const [name, setName] = useState('')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [isBusy, setIsBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+
+  function switchMode(next: AuthMode) {
+    setMode(next)
+    setError('')
+    setNotice('')
+    setPassword('')
+  }
+
+  async function submit(event: FormEvent) {
+    event.preventDefault()
+    if (!supabase) return
+    setError('')
+    setNotice('')
+    setIsBusy(true)
+    try {
+      if (mode === 'signin') {
+        const { error } = await supabase.auth.signInWithPassword({ email, password })
+        if (error) setError(authErrorMessage(error))
+      } else if (mode === 'signup') {
+        if (password.length < minPasswordLength) {
+          setError(`A senha precisa ter pelo menos ${minPasswordLength} caracteres.`)
+          return
+        }
+        const { data, error } = await supabase.auth.signUp({
+          email,
+          password,
+          options: { emailRedirectTo: window.location.origin, data: { full_name: name.trim() || undefined } },
+        })
+        if (error) setError(authErrorMessage(error))
+        else if (!data.session) {
+          setNotice('Enviamos um link de confirmação para o seu e-mail. Confirme para entrar.')
+          setMode('signin')
+          setPassword('')
+        }
+      } else {
+        const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin })
+        if (error) setError(authErrorMessage(error))
+        else setNotice('Se houver uma conta com este e-mail, você receberá um link para redefinir a senha.')
+      }
+    } finally {
+      setIsBusy(false)
+    }
+  }
+
+  function signInWithGoogle() {
+    setIsBusy(true)
     onGoogleSignIn()
   }
+
+  const submitLabel = mode === 'signin' ? 'Entrar' : mode === 'signup' ? 'Criar conta' : 'Enviar link de redefinição'
 
   return (
     <main className="auth-shell">
@@ -64,11 +120,64 @@ function AuthScreen({ onGoogleSignIn }: { onGoogleSignIn: () => void }) {
         <div className="auth-brand"><span className="brand-mark"><Activity size={17} /></span><strong>tailroom</strong></div>
         <div className="auth-icon"><ShieldCheck size={25} /></div>
         <span className="auth-kicker">PRIVATE LOG WORKSPACE</span>
-        <h1>Seus logs, sob seu controle.</h1>
-        <p className="auth-copy">Entre com sua conta Google para acessar seu espaço de trabalho com uma sessão protegida.</p>
-        <button className="google-button" onClick={() => void signIn()} disabled={isSigningIn || !isSupabaseConfigured}><Mail size={17} />{isSigningIn ? 'Redirecionando...' : 'Continuar com Google'}</button>
+        <h1>{mode === 'signup' ? 'Crie sua conta.' : mode === 'forgot' ? 'Recupere seu acesso.' : 'Seus logs, sob seu controle.'}</h1>
+        <p className="auth-copy">{mode === 'forgot' ? 'Informe o e-mail da sua conta para receber um link de redefinição de senha.' : 'Entre com Google ou e-mail para acessar seu espaço de trabalho com uma sessão protegida.'}</p>
+        {mode !== 'forgot' && <>
+          <button className="google-button" onClick={signInWithGoogle} disabled={isBusy || !isSupabaseConfigured}><Mail size={17} />Continuar com Google</button>
+          <div className="auth-divider"><span>ou com e-mail</span></div>
+        </>}
+        <form className="auth-form" onSubmit={(event) => void submit(event)}>
+          {mode === 'signup' && <label>Nome<input value={name} onChange={(event) => setName(event.target.value)} autoComplete="name" placeholder="Como devemos te chamar" /></label>}
+          <label>E-mail<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" placeholder="voce@empresa.com" required /></label>
+          {mode !== 'forgot' && <label>Senha<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete={mode === 'signup' ? 'new-password' : 'current-password'} minLength={mode === 'signup' ? minPasswordLength : undefined} required /></label>}
+          <button className="auth-submit" type="submit" disabled={isBusy || !isSupabaseConfigured}>{isBusy ? 'Aguarde...' : submitLabel}</button>
+        </form>
+        {error && <p className="auth-error">{error}</p>}
+        {notice && <p className="auth-notice">{notice}</p>}
+        <div className="auth-links">
+          {mode === 'signin' && <><button onClick={() => switchMode('forgot')}>Esqueci minha senha</button><button onClick={() => switchMode('signup')}>Criar conta</button></>}
+          {mode !== 'signin' && <button onClick={() => switchMode('signin')}>Já tenho conta · Entrar</button>}
+        </div>
         {!isSupabaseConfigured && <p className="auth-warning">Configure `VITE_SUPABASE_URL` e `VITE_SUPABASE_ANON_KEY` para ativar o login.</p>}
-        <div className="auth-security"><ShieldCheck size={14} /><span>OAuth do Google · sessão renovada automaticamente · dados isolados por usuário</span></div>
+        <div className="auth-security"><ShieldCheck size={14} /><span>Sessão renovada automaticamente · dados isolados por usuário</span></div>
+      </section>
+    </main>
+  )
+}
+
+function ResetPasswordScreen({ onDone }: { onDone: () => void }) {
+  const [password, setPassword] = useState('')
+  const [confirmation, setConfirmation] = useState('')
+  const [isBusy, setIsBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  async function submit(event: FormEvent) {
+    event.preventDefault()
+    if (!supabase) return
+    if (password.length < minPasswordLength) return setError(`A senha precisa ter pelo menos ${minPasswordLength} caracteres.`)
+    if (password !== confirmation) return setError('As senhas não conferem.')
+    setError('')
+    setIsBusy(true)
+    const { error } = await supabase.auth.updateUser({ password })
+    setIsBusy(false)
+    if (error) setError(authErrorMessage(error))
+    else onDone()
+  }
+
+  return (
+    <main className="auth-shell">
+      <section className="auth-panel">
+        <div className="auth-brand"><span className="brand-mark"><Activity size={17} /></span><strong>tailroom</strong></div>
+        <div className="auth-icon"><KeyRound size={25} /></div>
+        <span className="auth-kicker">NOVA SENHA</span>
+        <h1>Defina uma nova senha.</h1>
+        <p className="auth-copy">Escolha uma senha com pelo menos {minPasswordLength} caracteres.</p>
+        <form className="auth-form" onSubmit={(event) => void submit(event)}>
+          <label>Nova senha<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" minLength={minPasswordLength} required autoFocus /></label>
+          <label>Confirmar senha<input type="password" value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoComplete="new-password" minLength={minPasswordLength} required /></label>
+          <button className="auth-submit" type="submit" disabled={isBusy}>{isBusy ? 'Salvando...' : 'Salvar nova senha'}</button>
+        </form>
+        {error && <p className="auth-error">{error}</p>}
       </section>
     </main>
   )
@@ -86,35 +195,15 @@ function formatTime(date = new Date()) {
   return date.toLocaleTimeString('en-GB', { hour12: false }) + '.' + String(date.getMilliseconds()).padStart(3, '0')
 }
 
+function toSearchTerms(values: string[], offset = 0): SearchTerm[] {
+  return values.map((text, index) => ({ id: `${Date.now()}-${offset + index}`, text, color: termColors[(offset + index) % termColors.length] }))
+}
+
 function App() {
   const [session, setSession] = useState<Session | null>(null)
   const [authReady, setAuthReady] = useState(!isSupabaseConfigured)
   const [authError, setAuthError] = useState('')
-  const [lines, setLines] = useState<LogLine[]>([])
-  const [fileName, setFileName] = useState('')
-  const [fileHandle, setFileHandle] = useState<FileSystemFileHandle | null>(null)
-  const [sourceUrl, setSourceUrl] = useState('')
-  const [urlInput, setUrlInput] = useState('')
-  const [showUrlInput, setShowUrlInput] = useState(false)
-  const [sourceError, setSourceError] = useState('')
-  const [isLoading, setIsLoading] = useState(false)
-  const [isPaused, setIsPaused] = useState(false)
-  const [follow, setFollow] = useState(true)
-  const [searchTerms, setSearchTerms] = useState<SearchTerm[]>([])
-  const [termInput, setTermInput] = useState('')
-  const [history, setHistory] = useState<HistoryEntry[]>([])
-  const [level, setLevel] = useState<'ALL' | Level>('ALL')
-  const [caseSensitive, setCaseSensitive] = useState(false)
-  const [showLineNumbers, setShowLineNumbers] = useState(true)
-  const [wrapLines, setWrapLines] = useState(false)
-  const [showFilters, setShowFilters] = useState(false)
-  const [lastUpdated, setLastUpdated] = useState('live')
-  const [isDragging, setIsDragging] = useState(false)
-  const [selectedLine, setSelectedLine] = useState<{ line: LogLine; number: number } | null>(null)
-  const logRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLInputElement>(null)
-  const lastSizeRef = useRef(0)
-  const lastRemoteTextRef = useRef('')
+  const [isRecovering, setIsRecovering] = useState(isRecoveryRedirect)
 
   useEffect(() => {
     if (!supabase) return
@@ -126,17 +215,11 @@ function App() {
       setSession(data.session)
       setAuthReady(true)
     })
-    const { data: { subscription } } = client.auth.onAuthStateChange((_event, nextSession) => {
+    const { data: { subscription } } = client.auth.onAuthStateChange((event, nextSession) => {
+      if (event === 'PASSWORD_RECOVERY') setIsRecovering(true)
+      if (event === 'SIGNED_OUT') setIsRecovering(false)
       setSession(nextSession)
       setAuthReady(true)
-      if (nextSession?.user) {
-        void client.from('profiles').upsert({
-          id: nextSession.user.id,
-          display_name: nextSession.user.user_metadata.full_name ?? null,
-          avatar_url: nextSession.user.user_metadata.avatar_url ?? null,
-          email: nextSession.user.email ?? null,
-        }, { onConflict: 'id' })
-      }
     })
     return () => {
       active = false
@@ -157,30 +240,72 @@ function App() {
   }
 
   if (!authReady) return <main className="auth-shell"><div className="loading-spinner" /></main>
+  if (session && isRecovering) return <ResetPasswordScreen onDone={() => setIsRecovering(false)} />
   if (!session) return <><AuthScreen onGoogleSignIn={() => void signInWithGoogle()} />{authError && <div className="auth-toast">{authError}</div>}</>
+  // key: ao trocar de usuário o workspace é recriado, sem herdar estado do anterior.
+  return <LogWorkspace key={session.user.id} user={session.user} onSignOut={() => void signOut()} />
+}
 
-  function addSearchTerms(value: string) {
-    const values = value.split(/[\s,]+/).map((term) => term.trim()).filter(Boolean)
-    if (!values.length) return
-    setSearchTerms((current) => {
-      const existing = new Set(current.map((term) => term.text.toLowerCase()))
-      const added = values.filter((term) => !existing.has(term.toLowerCase())).map((text, index) => ({
-        id: `${Date.now()}-${index}`,
-        text,
-        color: termColors[(current.length + index) % termColors.length],
-      }))
-      return [...current, ...added]
+function LogWorkspace({ user, onSignOut }: { user: User; onSignOut: () => void }) {
+  const [lines, setLines] = useState<LogLine[]>([])
+  const [fileName, setFileName] = useState('')
+  const [fileHandle, setFileHandle] = useState<FileSystemFileHandle | null>(null)
+  const [sourceUrl, setSourceUrl] = useState('')
+  const [urlInput, setUrlInput] = useState('')
+  const [showUrlInput, setShowUrlInput] = useState(false)
+  const [sourceError, setSourceError] = useState('')
+  const [isLoading, setIsLoading] = useState(false)
+  const [isPaused, setIsPaused] = useState(false)
+  const [follow, setFollow] = useState(defaultSettings.follow)
+  const [searchTerms, setSearchTerms] = useState<SearchTerm[]>([])
+  const [termInput, setTermInput] = useState('')
+  const [openSources, setOpenSources] = useState<OpenSource[]>([])
+  const [activeId, setActiveId] = useState('')
+  const [savedUrls, setSavedUrls] = useState<SavedUrl[]>([])
+  const [level, setLevel] = useState<'ALL' | Level>(defaultSettings.level)
+  const [caseSensitive, setCaseSensitive] = useState(defaultSettings.case_sensitive)
+  const [showLineNumbers, setShowLineNumbers] = useState(defaultSettings.show_line_numbers)
+  const [wrapLines, setWrapLines] = useState(defaultSettings.wrap_lines)
+  const [settingsLoaded, setSettingsLoaded] = useState(false)
+  const [syncError, setSyncError] = useState('')
+  const [showFilters, setShowFilters] = useState(false)
+  const [lastUpdated, setLastUpdated] = useState('live')
+  const [isDragging, setIsDragging] = useState(false)
+  const [selectedLine, setSelectedLine] = useState<{ line: LogLine; number: number } | null>(null)
+  const logRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+  const lastSizeRef = useRef(0)
+  const lastRemoteTextRef = useRef('')
+
+  // Carrega as preferências e as URLs salvas do usuário logado.
+  useEffect(() => {
+    let active = true
+    void Promise.all([loadSettings(), loadSources()]).then(([settings, sources]) => {
+      if (!active) return
+      setLevel(settings.level)
+      setCaseSensitive(settings.case_sensitive)
+      setShowLineNumbers(settings.show_line_numbers)
+      setWrapLines(settings.wrap_lines)
+      setFollow(settings.follow)
+      setSearchTerms(toSearchTerms(settings.search_terms))
+      setSavedUrls(sources.map(({ id, name, url }) => ({ id, name, url })))
+    }).catch(() => {
+      if (active) setSyncError('Não foi possível carregar seus dados salvos.')
+    }).finally(() => {
+      if (active) setSettingsLoaded(true)
     })
-    setTermInput('')
-  }
+    return () => { active = false }
+  }, [])
 
-  function removeSearchTerm(id: string) {
-    setSearchTerms((current) => current.filter((term) => term.id !== id))
-  }
-
-  function addHistory(entry: HistoryEntry) {
-    setHistory((current) => [entry, ...current.filter((item) => item.id !== entry.id)])
-  }
+  // Salva as preferências (com debounce) depois do carregamento inicial.
+  useEffect(() => {
+    if (!settingsLoaded) return
+    const settings: UserSettings = { level, case_sensitive: caseSensitive, show_line_numbers: showLineNumbers, wrap_lines: wrapLines, follow, search_terms: searchTerms.map((term) => term.text) }
+    const timer = window.setTimeout(() => {
+      saveSettings(user.id, settings).then(() => setSyncError('')).catch(() => setSyncError('Não foi possível salvar suas preferências.'))
+    }, 600)
+    return () => window.clearTimeout(timer)
+  }, [settingsLoaded, user.id, level, caseSensitive, showLineNumbers, wrapLines, follow, searchTerms])
 
   useEffect(() => {
     if (!selectedLine) return
@@ -199,24 +324,6 @@ function App() {
     })
   }, [caseSensitive, level, lines, searchTerms])
 
-  const lineMatchesQuery = (message: string) => {
-    const searchableMessage = caseSensitive ? message : message.toLowerCase()
-    return searchTerms.length > 0 && searchTerms.some((term) => searchableMessage.includes(caseSensitive ? term.text : term.text.toLowerCase()))
-  }
-
-  function highlightMessage(message: string) {
-    if (!searchTerms.length) return message
-    const pattern = new RegExp(`(${searchTerms.map((term) => term.text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, caseSensitive ? 'g' : 'gi')
-    return message.split(pattern).map((part, index) => {
-      const term = searchTerms.find((item) => item.text.toLowerCase() === part.toLowerCase())
-      return term ? <mark key={`${part}-${index}`} style={{ backgroundColor: term.color, color: '#15201f' }}>{part}</mark> : part
-    })
-  }
-
-
-  function getRemoteRequestUrl(url: string) {
-    return url
-  }
   useEffect(() => {
     if (follow && !isPaused && logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight
   }, [filteredLines.length, follow, isPaused])
@@ -253,8 +360,6 @@ function App() {
         await loadText(text, getRemoteName(sourceUrl))
         setLastUpdated('just now')
         setSourceError('')
-        setLastUpdated('just now')
-        setSourceError('')
       } catch (error) {
         if (active) setSourceError(`Não foi possível atualizar a URL: ${error instanceof Error ? error.message : 'erro desconhecido'}. Verifique o endereço ou o CORS.`)
       }
@@ -266,6 +371,136 @@ function App() {
     }
   }, [isPaused, sourceUrl])
 
+  function addSearchTerms(value: string) {
+    const values = value.split(/[\s,]+/).map((term) => term.trim()).filter(Boolean)
+    if (!values.length) return
+    setSearchTerms((current) => {
+      const existing = new Set(current.map((term) => term.text.toLowerCase()))
+      return [...current, ...toSearchTerms(values.filter((term) => !existing.has(term.toLowerCase())), current.length)]
+    })
+    setTermInput('')
+  }
+
+  function removeSearchTerm(id: string) {
+    setSearchTerms((current) => current.filter((term) => term.id !== id))
+  }
+
+  function addOpenSource(source: OpenSource) {
+    setOpenSources((current) => current.some((item) => item.id === source.id) ? current : [...current, source])
+    setActiveId(source.id)
+  }
+
+  async function findOpenHandle(handle: FileSystemFileHandle) {
+    for (const source of openSources) {
+      if (source.handle && await source.handle.isSameEntry(handle)) return source
+    }
+    return undefined
+  }
+
+  function rememberUrl(name: string, url: string) {
+    setSavedUrls((current) => [{ ...current.find((item) => item.url === url), name, url }, ...current.filter((item) => item.url !== url)])
+    saveSource(user.id, name, url)
+      .then((id) => setSavedUrls((current) => current.map((item) => item.url === url ? { ...item, id } : item)))
+      .catch(() => setSyncError('Não foi possível salvar a URL no seu histórico.'))
+  }
+
+  async function removeSavedUrl(saved: SavedUrl) {
+    setSavedUrls((current) => current.filter((item) => item.url !== saved.url))
+    if (!saved.id) return
+    try {
+      await deleteSource(saved.id)
+    } catch {
+      setSyncError('Não foi possível remover a URL do seu histórico.')
+    }
+  }
+
+  async function showLocalFile(source: OpenSource) {
+    setIsLoading(true)
+    try {
+      const file = source.handle ? await source.handle.getFile() : source.file
+      if (!file) return
+      await loadText(await file.text(), file.name)
+      setFileHandle(source.handle ?? null)
+      setSourceUrl('')
+      setSourceError('')
+      lastSizeRef.current = file.size
+      addOpenSource(source)
+    } catch (error) {
+      setSourceError(`Não foi possível abrir o arquivo: ${error instanceof Error ? error.message : 'erro desconhecido'}`)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  async function showUrl(url: string, name = getRemoteName(url)) {
+    setIsLoading(true)
+    try {
+      setSourceError('')
+      const response = await fetch(getRemoteRequestUrl(url), { cache: 'no-store' })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const text = await response.text()
+      lastRemoteTextRef.current = text
+      await loadText(text, name)
+      setFileHandle(null)
+      setSourceUrl(url)
+      setUrlInput(url)
+      setShowUrlInput(false)
+      addOpenSource({ id: `url:${url}`, name, url })
+      rememberUrl(name, url)
+    } catch (error) {
+      setSourceError(`Não foi possível abrir a URL: ${error instanceof Error ? error.message : 'erro desconhecido'}. Verifique o endereço ou o CORS.`)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  function openPlainFile(file: File) {
+    return showLocalFile({ id: `file:${file.name}:${file.size}:${file.lastModified}`, name: file.name, file })
+  }
+
+  function selectSource(source: OpenSource) {
+    if (source.id === activeId) return
+    return source.url ? showUrl(source.url, source.name) : showLocalFile(source)
+  }
+
+  function closeSource(source: OpenSource) {
+    const index = openSources.findIndex((item) => item.id === source.id)
+    const remaining = openSources.filter((item) => item.id !== source.id)
+    setOpenSources(remaining)
+    if (source.id !== activeId) return
+    const next = remaining[Math.min(index, remaining.length - 1)]
+    if (next) void selectSource(next)
+    else resetView()
+  }
+
+  function resetView() {
+    setLines([])
+    setFileName('')
+    setFileHandle(null)
+    setSourceUrl('')
+    setSourceError('')
+    setActiveId('')
+    setLastUpdated('live')
+  }
+
+  const lineMatchesQuery = (message: string) => {
+    const searchableMessage = caseSensitive ? message : message.toLowerCase()
+    return searchTerms.length > 0 && searchTerms.some((term) => searchableMessage.includes(caseSensitive ? term.text : term.text.toLowerCase()))
+  }
+
+  function highlightMessage(message: string) {
+    if (!searchTerms.length) return message
+    const pattern = new RegExp(`(${searchTerms.map((term) => term.text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, caseSensitive ? 'g' : 'gi')
+    return message.split(pattern).map((part, index) => {
+      const term = searchTerms.find((item) => item.text.toLowerCase() === part.toLowerCase())
+      return term ? <mark key={`${part}-${index}`} style={{ backgroundColor: term.color, color: '#15201f' }}>{part}</mark> : part
+    })
+  }
+
+  function getRemoteRequestUrl(url: string) {
+    return url
+  }
+
   function getRemoteName(url: string) {
     try {
       return decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).pop() || new URL(url).hostname)
@@ -275,25 +510,19 @@ function App() {
   }
 
   async function openFile() {
-    if ('showOpenFilePicker' in window) {
-      const picker = (window as Window & { showOpenFilePicker: (options?: object) => Promise<FileSystemFileHandle[]> }).showOpenFilePicker
-      const [handle] = await picker({ types: [{ description: 'Log files', accept: { 'text/plain': ['.log', '.txt'] } }] })
-      setIsLoading(true)
-      try {
-        const file = await handle.getFile()
-        const text = await file.text()
-        await loadText(text, file.name)
-        setFileHandle(handle)
-        setSourceUrl('')
-        setSourceError('')
-        addHistory({ id: `file:${file.name}`, name: file.name, handle })
-        lastSizeRef.current = file.size
-      } finally {
-        setIsLoading(false)
-      }
+    if (!('showOpenFilePicker' in window)) {
+      inputRef.current?.click()
       return
     }
-    inputRef.current?.click()
+    const picker = (window as Window & { showOpenFilePicker: (options?: object) => Promise<FileSystemFileHandle[]> }).showOpenFilePicker
+    let handle: FileSystemFileHandle
+    try {
+      [handle] = await picker({ types: [{ description: 'Log files', accept: { 'text/plain': ['.log', '.txt'] } }] })
+    } catch {
+      return // Seletor cancelado pelo usuário.
+    }
+    const existing = await findOpenHandle(handle)
+    await showLocalFile(existing ?? { id: `file:${crypto.randomUUID()}`, name: handle.name, handle })
   }
 
   async function loadText(text: string, name: string) {
@@ -321,88 +550,18 @@ function App() {
       setSourceError('Informe uma URL HTTP ou HTTPS válida.')
       return
     }
-    try {
-      setSourceError('')
-      setIsLoading(true)
-      const response = await fetch(getRemoteRequestUrl(url), { cache: 'no-store' })
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      const text = await response.text()
-      lastRemoteTextRef.current = text
-      await loadText(text, getRemoteName(url))
-      setFileHandle(null)
-      setSourceUrl(url)
-      setUrlInput(url)
-      setShowUrlInput(false)
-      addHistory({ id: `url:${url}`, name: getRemoteName(url), url })
-    } catch (error) {
-      setSourceError(`Não foi possível abrir a URL: ${error instanceof Error ? error.message : 'erro desconhecido'}. Verifique o endereço ou o CORS.`)
-    } finally {
-      setIsLoading(false)
-    }
+    await showUrl(url)
   }
 
   async function handleFallbackFile(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0]
-    if (file) {
-      setIsLoading(true)
-      try {
-        await loadText(await file.text(), file.name)
-        addHistory({ id: `file:${file.name}`, name: file.name })
-      } finally {
-        setIsLoading(false)
-      }
-    }
-  }
-
-  async function selectHistory(entry: HistoryEntry) {
-    if (entry.url) {
-      setUrlInput(entry.url)
-      setIsLoading(true)
-      try {
-        const response = await fetch(entry.url, { cache: 'no-store' })
-        if (!response.ok) throw new Error(`HTTP ${response.status}`)
-        const text = await response.text()
-        lastRemoteTextRef.current = text
-        await loadText(text, entry.name)
-        setFileHandle(null)
-        setSourceUrl(entry.url)
-        setSourceError('')
-      } catch (error) {
-        setSourceError(`Não foi possível abrir o histórico: ${error instanceof Error ? error.message : 'erro desconhecido'}`)
-      } finally {
-        setIsLoading(false)
-      }
-      return
-    }
-    if (entry.handle) {
-      setIsLoading(true)
-      try {
-        const file = await entry.handle.getFile()
-        await loadText(await file.text(), file.name)
-        setFileHandle(entry.handle)
-        setSourceUrl('')
-        lastSizeRef.current = file.size
-      } finally {
-        setIsLoading(false)
-      }
-    }
+    event.target.value = '' // Permite selecionar o mesmo arquivo de novo.
+    if (file) await openPlainFile(file)
   }
 
   function clearView() {
     setLines([])
     setLastUpdated('cleared')
-  }
-
-  function resetSample() {
-    setLines([])
-    setFileName('')
-    setFileHandle(null)
-    setSourceUrl('')
-    setSourceError('')
-    setUrlInput('')
-    setLastUpdated('live')
-    setSearchTerms([])
-    setTermInput('')
   }
 
   return (
@@ -412,20 +571,23 @@ function App() {
         <div className="topbar-actions">
           <button className="icon-button" title="Settings"><Settings2 size={18} /></button>
           <span className="divider" />
-          <ProfileMenu user={session.user} onSignOut={() => void signOut()} />
+          <ProfileMenu user={user} onSignOut={onSignOut} />
         </div>
       </header>
 
       <section className="workspace">
         <aside className="sidebar">
           <div className="sidebar-heading"><span>FILES</span><button className="mini-button" onClick={openFile} title="Open log"><FileUp size={15} /></button></div>
-          {fileName ? <button className="file-item active"><span className="status-dot" /><span className="file-label"><strong>{fileName}</strong><small>{lines.length.toLocaleString('pt-BR')} lines</small></span><span className="file-menu">•••</span></button> : <div className="no-file">No file selected</div>}
-          {history.length > 0 && <div className="history-list"><span className="section-label">HISTORY</span>{history.map((entry) => <button className={'history-item ' + (entry.name === fileName ? 'active' : '')} key={entry.id} onClick={() => void selectHistory(entry)} title={entry.url ?? entry.name}><span className={entry.url ? 'history-icon remote' : 'history-icon'}>{entry.url ? <Globe size={12} /> : <FolderOpen size={12} />}</span><span>{entry.name}</span></button>)}</div>}
+          {openSources.length > 0 ? <div className="open-files">{openSources.map((source) => {
+            const active = source.id === activeId
+            return <div className={'file-row ' + (active ? 'active' : '')} key={source.id}><button className={'file-item ' + (active ? 'active' : '')} onClick={() => void selectSource(source)} title={source.url ?? source.name}>{active ? <span className="status-dot" /> : <span className={source.url ? 'history-icon remote' : 'history-icon'}>{source.url ? <Globe size={12} /> : <FolderOpen size={12} />}</span>}<span className="file-label"><strong>{source.name}</strong><small>{active ? `${lines.length.toLocaleString('pt-BR')} lines` : source.url ? 'Remote URL' : 'Local file'}</small></span></button><button className="file-close" onClick={() => closeSource(source)} aria-label={`Close ${source.name}`} title="Close"><X size={12} /></button></div>
+          })}</div> : <div className="no-file">No file selected</div>}
+          {savedUrls.some((saved) => !openSources.some((source) => source.url === saved.url)) && <div className="history-list"><span className="section-label">HISTORY</span>{savedUrls.filter((saved) => !openSources.some((source) => source.url === saved.url)).map((saved) => <div className="history-row" key={saved.url}><button className="history-item" onClick={() => void showUrl(saved.url, saved.name)} title={saved.url}><span className="history-icon remote"><Globe size={12} /></span><span>{saved.name}</span></button><button className="history-remove" onClick={() => void removeSavedUrl(saved)} aria-label={`Remove ${saved.name} from history`} title="Remove from history"><X size={11} /></button></div>)}</div>}
           <button className="add-file" onClick={openFile}><FolderOpen size={15} /> Open another file</button>
           <button className="add-file" onClick={() => setShowUrlInput(!showUrlInput)}><Globe size={15} /> Open from URL</button>
           {showUrlInput && <div className="url-panel"><input value={urlInput} onChange={(event) => setUrlInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void openUrl() }} placeholder="https://.../log.json" autoFocus /><button onClick={() => void openUrl()}><Globe size={13} /> Open</button></div>}
           <div className="sidebar-section"><span className="section-label">SESSION</span><div className="session-row"><span className="pulse" />{sourceUrl ? 'Remote URL active' : 'Watching active'}</div><div className="session-row muted"><RefreshCw size={13} />Polling every 1s</div></div>
-          <div className="sidebar-footer"><div className="tip"><Info size={14} /><span>{sourceUrl ? 'The URL is refreshed every second.' : <>Open any <b>.log</b> or <b>.txt</b> file to begin tailing.</>}</span></div>{sourceError && <div className="source-error"><AlertTriangle size={14} />{sourceError}</div>}</div>
+          <div className="sidebar-footer"><div className="tip"><Info size={14} /><span>{sourceUrl ? 'The URL is refreshed every second.' : <>Open any <b>.log</b> or <b>.txt</b> file to begin tailing.</>}</span></div>{sourceError && <div className="source-error"><AlertTriangle size={14} />{sourceError}</div>}{syncError && <div className="source-error"><AlertTriangle size={14} />{syncError}</div>}</div>
         </aside>
 
         <section className="content">
@@ -443,7 +605,7 @@ function App() {
 
           {showFilters && <div className="filter-panel"><div className="filter-group"><label>Level</label><div className="level-picker">{(['ALL', 'INFO', 'WARN', 'ERROR', 'DEBUG'] as const).map((item) => <button key={item} className={level === item ? 'chosen ' + item.toLowerCase() : ''} onClick={() => setLevel(item)}>{level === item && <Check size={13} />}{item}</button>)}</div></div><label className="check-label"><input type="checkbox" checked={caseSensitive} onChange={(event) => setCaseSensitive(event.target.checked)} /> Case sensitive</label><label className="check-label"><input type="checkbox" checked={showLineNumbers} onChange={(event) => setShowLineNumbers(event.target.checked)} /> Line numbers</label><label className="check-label"><input type="checkbox" checked={wrapLines} onChange={(event) => setWrapLines(event.target.checked)} /> Wrap lines</label></div>}
 
-          <div className={'log-window ' + (isDragging ? 'dragging' : '')} ref={logRef} onDragOver={(event) => { event.preventDefault(); setIsDragging(true) }} onDragLeave={() => setIsDragging(false)} onDrop={async (event) => { event.preventDefault(); setIsDragging(false); const file = event.dataTransfer.files[0]; if (file) { setIsLoading(true); try { await loadText(await file.text(), file.name); addHistory({ id: `file:${file.name}`, name: file.name }) } finally { setIsLoading(false) } } }}>
+          <div className={'log-window ' + (isDragging ? 'dragging' : '')} ref={logRef} onDragOver={(event) => { event.preventDefault(); setIsDragging(true) }} onDragLeave={() => setIsDragging(false)} onDrop={async (event) => { event.preventDefault(); setIsDragging(false); for (const file of Array.from(event.dataTransfer.files)) await openPlainFile(file) }}>
             {isDragging && <div className="drop-overlay"><FileUp size={28} /><strong>Drop log file to open</strong></div>}
             {isLoading ? <div className="loading-state"><span className="loading-spinner" /><strong>Loading log...</strong><span>Reading the selected source</span></div> : filteredLines.length === 0 ? <div className="empty-state"><Search size={25} /><strong>{fileName ? 'No lines match your filters' : 'No log loaded'}</strong><span>{fileName ? 'Try a different search or level.' : 'Open a file or URL to start tailing.'}</span></div> : filteredLines.map((line, index) => <button className={'log-line ' + (lineMatchesQuery(line.message) ? 'matched' : '')} key={line.id} onClick={() => setSelectedLine({ line, number: index + 1 })} title="Click to view the complete line"><span className="line-time">{line.timestamp}</span>{showLineNumbers && <span className="line-number">{String(index + 1).padStart(4, '0')}</span>}<span className={'line-level ' + levelClass[line.level]}>{line.level}</span><span className={'line-message ' + (wrapLines ? 'wrapped' : '')}>{highlightMessage(line.message)}</span></button>)}
           </div>

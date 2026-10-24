@@ -2,10 +2,13 @@
 
 ## Supabase e Google
 
-1. Crie um projeto no Supabase e execute `supabase/schema.sql` no SQL Editor.
-2. Em Authentication > Providers, habilite Google e configure o Client ID/Secret do Google Cloud.
-3. Em Authentication > URL Configuration, adicione a URL pública do app e o callback `https://SEU-PROJETO.supabase.co/auth/v1/callback`.
-4. Crie um arquivo `.env.local` (não versione) com:
+O passo a passo completo está em [README.md › Configuração do Supabase](README.md#configuração-do-supabase). Resumo:
+
+1. Execute `supabase/schema.sql` no SQL Editor (idempotente; rode de novo a cada atualização do schema).
+2. Em Authentication > Sign In / Providers, habilite Google (Client ID/Secret) e Email (com *Confirm email*).
+3. Configure um SMTP próprio para os e-mails de confirmação e de redefinição de senha.
+4. Em Authentication > URL Configuration, defina o Site URL e adicione a URL pública do app em Redirect URLs. No Google Cloud, cadastre o callback `https://SEU-PROJETO.supabase.co/auth/v1/callback`.
+5. Crie um arquivo `.env.local` (não versione) com:
 
 ```env
 VITE_SUPABASE_URL=https://SEU-PROJETO.supabase.co

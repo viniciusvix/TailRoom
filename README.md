@@ -6,14 +6,15 @@ O tailroom é uma aplicação web (SPA) que permite abrir arquivos `.log` / `.tx
 
 ## Funcionalidades
 
-- **Login com Google** (OAuth) com sessão renovada automaticamente.
+- **Login com Google** (OAuth) **ou e-mail e senha** (com confirmação de e-mail e recuperação de senha), com sessão renovada automaticamente.
+- **Multiusuário**: preferências, termos de busca e histórico de URLs ficam salvos por usuário no Supabase e isolados por RLS.
 - **Abertura de arquivos locais** via seletor de arquivos do navegador ou arrastando e soltando o arquivo na tela.
 - **Acompanhamento ao vivo (live tail)** de arquivos locais: o app verifica o arquivo a cada 1 segundo e adiciona apenas o conteúdo novo.
 - **Abertura de logs remotos por URL** (HTTP/HTTPS), atualizados a cada 1 segundo.
-- **Histórico** de arquivos e URLs abertos na sessão.
+- **Histórico** de arquivos (na sessão) e URLs (salvas na conta), com remoção individual.
 - **Filtros**:
   - por nível: `ALL`, `INFO`, `WARN`, `ERROR`, `DEBUG` (detectado pelo texto da linha);
-  - busca por um ou mais termos (uma linha precisa conter todos os termos);
+  - busca por um ou mais termos (aparece toda linha que contiver pelo menos um dos termos);
   - diferenciação entre maiúsculas e minúsculas;
   - destaque dos termos encontrados.
 - **Controles de visualização**: pausar/retomar, modo *Follow* (rolagem automática), números de linha, quebra de linha e limpeza da visualização.
@@ -24,7 +25,7 @@ O tailroom é uma aplicação web (SPA) que permite abrir arquivos `.log` / `.tx
 
 - [React 19](https://react.dev/) + [TypeScript](https://www.typescriptlang.org/)
 - [Vite](https://vite.dev/) como bundler e servidor de desenvolvimento
-- [Supabase](https://supabase.com/) (autenticação Google e tabela `profiles`)
+- [Supabase](https://supabase.com/) (autenticação Google e e-mail/senha, tabelas `profiles`, `user_settings` e `log_sources` com RLS)
 - [lucide-react](https://lucide.dev/) para ícones
 - [Nginx](https://nginx.org/) para servir o build estático em produção
 - Docker / Podman para empacotamento
@@ -38,9 +39,10 @@ O tailroom é uma aplicação web (SPA) que permite abrir arquivos `.log` / `.tx
 │   ├── main.tsx           # Ponto de entrada do React
 │   ├── index.css          # Estilos
 │   ├── lib/supabase.ts    # Cliente Supabase (lê as variáveis VITE_*)
+│   ├── lib/userData.ts    # Leitura/gravação de preferências e URLs do usuário
 │   └── vite-env.d.ts
 ├── supabase/
-│   └── schema.sql         # Tabela profiles, políticas RLS e trigger de updated_at
+│   └── schema.sql         # Tabelas, políticas RLS e triggers (perfil automático, updated_at)
 ├── Dockerfile             # Build multi-stage: Node 24 (build) + Nginx 1.27 (runtime)
 ├── nginx.conf             # Headers de segurança, fallback para SPA e /healthz
 ├── DEPLOY.md              # Passo a passo de deploy com Podman
@@ -57,11 +59,49 @@ O tailroom é uma aplicação web (SPA) que permite abrir arquivos `.log` / `.tx
 
 ## Configuração do Supabase
 
-1. Crie um projeto no Supabase e execute o conteúdo de `supabase/schema.sql` no SQL Editor. Isso cria a tabela `public.profiles` com Row Level Security: cada usuário só lê e altera o próprio perfil.
-2. Em **Authentication > Providers**, habilite o **Google** e informe o Client ID e o Client Secret.
-3. Em **Authentication > URL Configuration**, adicione:
-   - a URL pública da aplicação (por exemplo, `http://127.0.0.1:5173` em ambiente local);
-   - o callback `https://SEU-PROJETO.supabase.co/auth/v1/callback`, que também precisa estar cadastrado como URI de redirecionamento no Google Cloud.
+O tailroom é multiusuário com **dados isolados por usuário**: qualquer pessoa pode criar conta, e cada uma só enxerga os próprios dados. O isolamento é garantido no banco por Row Level Security (RLS), não pelo frontend.
+
+### 1. Banco de dados
+
+No **SQL Editor** do projeto, execute todo o conteúdo de [`supabase/schema.sql`](supabase/schema.sql). O script é idempotente (pode ser executado de novo sem perder dados) e cria:
+
+| Tabela | Conteúdo | Acesso (RLS) |
+| --- | --- | --- |
+| `profiles` | Nome, avatar e e-mail do usuário | Lê e altera só o próprio perfil |
+| `user_settings` | Nível, filtros, termos de busca, *follow*, números de linha, quebra de linha | Lê, cria e altera só as próprias preferências |
+| `log_sources` | URLs remotas abertas (histórico persistente) | CRUD só nas próprias URLs |
+
+Ele também cria o trigger `on_auth_user_created`, que gera o perfil e as preferências padrão de cada novo usuário (Google ou e-mail), e preenche esses registros para usuários que já existiam.
+
+> Arquivos locais **não** são salvos no banco: o conteúdo nunca sai do navegador, e o navegador não permite reabrir o arquivo em outro dispositivo.
+
+### 2. Login com Google
+
+1. No [Google Cloud Console](https://console.cloud.google.com/apis/credentials), crie um **OAuth Client ID** do tipo *Web application*.
+2. Em *Authorized redirect URIs*, cadastre `https://SEU-PROJETO.supabase.co/auth/v1/callback`.
+3. No Supabase, em **Authentication > Sign In / Providers > Google**, habilite o provedor e informe o Client ID e o Client Secret.
+
+### 3. Login com e-mail e senha
+
+1. Em **Authentication > Sign In / Providers > Email**, confirme que o provedor está habilitado e que **Confirm email** está ligado.
+2. Em **Authentication > Policies** (ou **Password**), defina o tamanho mínimo de senha para **8** (o mesmo valor validado no app) e, se quiser, exija letras e números.
+3. **SMTP:** o servidor de e-mail padrão do Supabase envia poucas mensagens por hora e é só para testes. Em produção, configure um SMTP próprio em **Project Settings > Authentication > SMTP Settings** (Resend, SendGrid, Amazon SES etc.).
+4. Opcional: traduza os modelos de e-mail em **Authentication > Emails** (*Confirm signup* e *Reset password*).
+
+O app oferece cadastro, login, "Esqueci minha senha" e a tela de nova senha. O link de redefinição volta para a URL do app, que abre a tela "Defina uma nova senha".
+
+### 4. URLs permitidas
+
+Em **Authentication > URL Configuration**:
+
+- **Site URL:** a URL pública de produção (por exemplo, `https://tailroom.suaempresa.com`).
+- **Redirect URLs:** todas as origens em que o app roda, por exemplo `http://localhost:5173`, `http://127.0.0.1:5173` e a URL de produção.
+
+Os links de confirmação de e-mail, de redefinição de senha e o retorno do Google só funcionam para origens dessa lista.
+
+### 5. Chaves
+
+Em **Project Settings > API**, copie a **Project URL** e a chave **anon / publishable** para as variáveis abaixo.
 
 ## Variáveis de ambiente
 
@@ -145,7 +185,7 @@ O `nginx.conf` envia os seguintes cabeçalhos:
 
 Observações:
 
-- A tabela `profiles` depende de RLS; não desabilite as políticas.
+- O isolamento entre usuários depende de RLS nas tabelas `profiles`, `user_settings` e `log_sources`; não desabilite as políticas. Ao criar novas tabelas com dados de usuário, habilite RLS e filtre por `auth.uid()`.
 - Os arquivos abertos são lidos integralmente no navegador e não são enviados a nenhum servidor pelo tailroom.
 
 ## Limitações conhecidas
